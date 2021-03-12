@@ -19,7 +19,7 @@ To use it in Unity,
 - This project is mainly to show how to use Reseach Mode in Unity. I only provided implementation on AHAT camera image visualization and point cloud reconstruction (based on depth map of AHAT camera). Feel free to modify the code according to your own need.
 - If you need some sample script to get started, you can refer to [here](https://github.com/petergu684/HoloLens2-ResearchMode-Unity/issues/1#issuecomment-689762815).
 
-## Modifications
+## Fork Modifications
 
 Brings in non-forked modifications from plugin in ROS project:
 https://github.com/GazeControl/HL2-ResearchMode
