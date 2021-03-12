@@ -8,7 +8,9 @@ HMODULE LoadLibraryA(
 );
 
 static ResearchModeSensorConsent camAccessCheck;
+static ResearchModeSensorConsent imuAccessCheck;
 static HANDLE camConsentGiven;
+static HANDLE imuConsentGiven;
 
 using namespace DirectX;
 using namespace winrt::Windows::Perception;
@@ -23,6 +25,7 @@ namespace winrt::HL2UnityPlugin::implementation
     {
         // Load Research Mode library
         camConsentGiven = CreateEvent(nullptr, true, false, nullptr);
+        imuConsentGiven = CreateEvent(nullptr, true, false, nullptr);
         HMODULE hrResearchMode = LoadLibraryA("ResearchModeAPI");
         HRESULT hr = S_OK;
         
@@ -52,6 +55,7 @@ namespace winrt::HL2UnityPlugin::implementation
 
         winrt::check_hresult(m_pSensorDevice->QueryInterface(IID_PPV_ARGS(&m_pSensorDeviceConsent)));
         winrt::check_hresult(m_pSensorDeviceConsent->RequestCamAccessAsync(HL2ResearchMode::CamAccessOnComplete));
+        winrt::check_hresult(m_pSensorDeviceConsent->RequestIMUAccessAsync(HL2ResearchMode::ImuAccessOnComplete));
         
         m_pSensorDevice->DisableEyeSelection();
 
@@ -61,15 +65,58 @@ namespace winrt::HL2UnityPlugin::implementation
 
         for (auto sensorDescriptor : m_sensorDescriptors)
         {
+            IResearchModeCameraSensor* pCameraSensor = nullptr;
+
+            if (sensorDescriptor.sensorType == LEFT_FRONT)
+            {
+                winrt::check_hresult(m_pSensorDevice->GetSensor(sensorDescriptor.sensorType, &m_pLFCameraSensor));
+                //winrt::check_hresult(m_pLFCameraSensor->QueryInterface(IID_PPV_ARGS(&pCameraSensor)));
+                //winrt::check_hresult(pCameraSensor->GetCameraExtrinsicsMatrix(&m_LFCameraPose));
+            }
+
+            if (sensorDescriptor.sensorType == RIGHT_FRONT)
+            {
+                winrt::check_hresult(m_pSensorDevice->GetSensor(sensorDescriptor.sensorType, &m_pRFCameraSensor));
+               // winrt::check_hresult(m_pRFCameraSensor->QueryInterface(IID_PPV_ARGS(&pCameraSensor)));
+                //winrt::check_hresult(pCameraSensor->GetCameraExtrinsicsMatrix(&m_RFCameraPose));
+            }
+
+#define DEPTH_USE_LONG_THROW
+            //#undef  DEPTH_USE_LONG_THROW
+
+#ifdef DEPTH_USE_LONG_THROW
+            if (sensorDescriptor.sensorType == DEPTH_LONG_THROW)
+            {
+                winrt::check_hresult(m_pSensorDevice->GetSensor(sensorDescriptor.sensorType, &m_LTDepthSensor));
+            }
+#else
             if (sensorDescriptor.sensorType == DEPTH_AHAT)
             {
                 winrt::check_hresult(m_pSensorDevice->GetSensor(sensorDescriptor.sensorType, &m_depthSensor));
                 winrt::check_hresult(m_depthSensor->QueryInterface(IID_PPV_ARGS(&m_pDepthCameraSensor)));
                 winrt::check_hresult(m_pDepthCameraSensor->GetCameraExtrinsicsMatrix(&m_depthCameraPose));
                 m_depthCameraPoseInvMatrix = XMMatrixInverse(nullptr, XMLoadFloat4x4(&m_depthCameraPose));
-                break;
+                //break;
             }
+#endif
+            if (sensorDescriptor.sensorType == IMU_ACCEL)
+            {
+                winrt::check_hresult(m_pSensorDevice->GetSensor(sensorDescriptor.sensorType, &m_pAccelSensor));
+            }
+            if (sensorDescriptor.sensorType == IMU_GYRO)
+            {
+                winrt::check_hresult(m_pSensorDevice->GetSensor(sensorDescriptor.sensorType, &m_pGyroSensor));
+            }
+            if (sensorDescriptor.sensorType == IMU_MAG)
+            {
+                winrt::check_hresult(m_pSensorDevice->GetSensor(sensorDescriptor.sensorType, &m_pMagSensor));
+            }
+
         }
+
+        m_AccelBuffer[0] = 0.0;
+        m_AccelBuffer[1] = 1.0;
+        m_AccelBuffer[2] = 2.0;
     }
 
     void HL2ResearchMode::StartDepthSensorLoop() 
@@ -79,10 +126,223 @@ namespace winrt::HL2UnityPlugin::implementation
         {
             m_refFrame = m_locator.GetDefault().CreateStationaryFrameOfReferenceAtCurrentLocation().CoordinateSystem();
         }
+        if (m_LTDepthSensor)
+        {
+            m_pLTDepthUpdateThread = new std::thread(HL2ResearchMode::DepthSensorDALoop, this);
+        }
+          
+        if (m_depthSensor)
+        {
+            m_pDepthUpdateThread = new std::thread(HL2ResearchMode::DepthSensorLoop, this);
+        }
 
-        m_pDepthUpdateThread = new std::thread(HL2ResearchMode::DepthSensorLoop, this);
+
+        m_pLFCameraUpdateThread= new std::thread(HL2ResearchMode::LFCameraSensorLoop, this);
+        m_pRFCameraUpdateThread = new std::thread(HL2ResearchMode::RFCameraSensorLoop, this);
+
+        m_AccelUpdateThread = new std::thread(HL2ResearchMode::AccelSensorLoop, this);
+        m_GyroUpdateThread = new std::thread(HL2ResearchMode::GyroSensorLoop, this);
+        m_MagUpdateThread = new std::thread(HL2ResearchMode::MagSensorLoop, this);
+
     }
+    void HL2ResearchMode::LFCameraSensorLoop(HL2ResearchMode* pHL2ResearchMode)
+    {
+        // prevent starting loop for multiple times
+        if (!pHL2ResearchMode->m_LFCameraLoopStarted)
+        {
+            pHL2ResearchMode->m_LFCameraLoopStarted = true;
+        }
+        else {
+            return;
+        }
 
+        pHL2ResearchMode->m_pLFCameraSensor->OpenStream();
+
+        try
+        {
+            while (pHL2ResearchMode->m_LFCameraLoopStarted)
+            {
+                IResearchModeSensorFrame* pSensorFrame = nullptr;
+                ResearchModeSensorResolution resolution;
+                pHL2ResearchMode->m_pLFCameraSensor->GetNextBuffer(&pSensorFrame);
+
+                // process sensor frame
+                pSensorFrame->GetResolution(&resolution);
+                pHL2ResearchMode->m_LFCameraResolution = resolution;
+
+                IResearchModeSensorVLCFrame* pVLCFrame = nullptr;
+                winrt::check_hresult(pSensorFrame->QueryInterface(IID_PPV_ARGS(&pVLCFrame)));
+
+                size_t outBufferCount = 0;
+                const UINT8* pImage = nullptr;
+                pVLCFrame->GetBuffer(&pImage, &outBufferCount);
+                pHL2ResearchMode->m_LFCameraBufferSize = outBufferCount;
+
+                auto pTexture = std::make_unique<uint8_t[]>(outBufferCount);
+
+                for (UINT i = 0; i < resolution.Height; i++)
+                {
+                    for (UINT j = 0; j < resolution.Width; j++)
+                    {
+                        auto idx = resolution.Width * i + j;
+                        UINT16 depth = pImage[idx];
+
+                        if (depth == 0) { pTexture.get()[idx] = 0; }
+                        else { pTexture.get()[idx] = (uint8_t)((float)depth); }
+                        
+                    }
+                }
+            
+
+                // save data
+                {
+                    std::lock_guard<std::mutex> l(pHL2ResearchMode->LFC);
+
+
+                    // save raw depth map
+                    if (!pHL2ResearchMode->m_LFCameraBuffer)
+                    {
+                        OutputDebugString(L"Create Space for depth map...\n");
+                        pHL2ResearchMode->m_LFCameraBuffer = new UINT8[outBufferCount];
+                    }
+                    memcpy(pHL2ResearchMode->m_LFCameraBuffer, pTexture.get(), outBufferCount * sizeof(UINT8));
+
+                    //// save pre-processed depth map texture (for visualization)
+                    //if (!pHL2ResearchMode->m_depthMapTexture)
+                    //{
+                    //    OutputDebugString(L"Create Space for depth map texture...\n");
+                    //    pHL2ResearchMode->m_depthMapTexture = new UINT8[outBufferCount];
+                    //}
+                    //memcpy(pHL2ResearchMode->m_depthMapTexture, pDepthTexture.get(), outBufferCount * sizeof(UINT8));
+                }
+
+                pHL2ResearchMode->m_LFCameraTextureUpdated = true;
+                //pHL2ResearchMode->m_pointCloudUpdated = true;
+
+                pTexture.reset();
+
+                // release space
+                if (pSensorFrame) {
+                    pSensorFrame->Release();
+                }
+                if (pVLCFrame)
+                {
+                    pVLCFrame->Release();
+                }
+
+            }
+        }
+        catch (...) {}
+        pHL2ResearchMode->m_pLFCameraSensor->CloseStream();
+        pHL2ResearchMode->m_pLFCameraSensor->Release();
+        pHL2ResearchMode->m_pLFCameraSensor = nullptr;
+        pHL2ResearchMode->m_pRFCameraSensor->CloseStream();
+        pHL2ResearchMode->m_pRFCameraSensor->Release();
+        pHL2ResearchMode->m_pRFCameraSensor = nullptr;
+        pHL2ResearchMode->m_pSensorDevice->Release();
+        pHL2ResearchMode->m_pSensorDevice = nullptr;
+        pHL2ResearchMode->m_pSensorDeviceConsent->Release();
+        pHL2ResearchMode->m_pSensorDeviceConsent = nullptr;
+    }
+    void HL2ResearchMode::RFCameraSensorLoop(HL2ResearchMode* pHL2ResearchMode)
+    {
+        // prevent starting loop for multiple times
+        if (!pHL2ResearchMode->m_RFCameraLoopStarted)
+        {
+            pHL2ResearchMode->m_RFCameraLoopStarted = true;
+        }
+        else {
+            return;
+        }
+
+        pHL2ResearchMode->m_pRFCameraSensor->OpenStream();
+
+        try
+        {
+            while (pHL2ResearchMode->m_RFCameraLoopStarted)
+            {
+                IResearchModeSensorFrame* pSensorFrame = nullptr;
+                ResearchModeSensorResolution resolution;
+                pHL2ResearchMode->m_pRFCameraSensor->GetNextBuffer(&pSensorFrame);
+
+                // process sensor frame
+                pSensorFrame->GetResolution(&resolution);
+                pHL2ResearchMode->m_RFCameraResolution = resolution;
+
+                IResearchModeSensorVLCFrame* pVLCFrame = nullptr;
+                winrt::check_hresult(pSensorFrame->QueryInterface(IID_PPV_ARGS(&pVLCFrame)));
+
+                size_t outBufferCount = 0;
+                const UINT8* pImage = nullptr;
+                pVLCFrame->GetBuffer(&pImage, &outBufferCount);
+                pHL2ResearchMode->m_RFCameraBufferSize = outBufferCount;
+
+                auto pTexture = std::make_unique<uint8_t[]>(outBufferCount);
+
+                for (UINT i = 0; i < resolution.Height; i++)
+                {
+                    for (UINT j = 0; j < resolution.Width; j++)
+                    {
+                        auto idx = resolution.Width * i + j;
+                        UINT16 depth = pImage[idx];
+
+                        if (depth == 0) { pTexture.get()[idx] = 0; }
+                        else { pTexture.get()[idx] = (uint8_t)((float)depth); }
+
+                    }
+                }
+
+
+                // save data
+                {
+                    std::lock_guard<std::mutex> l(pHL2ResearchMode->RFC);
+
+
+                    // save raw depth map
+                    if (!pHL2ResearchMode->m_RFCameraBuffer)
+                    {
+                        OutputDebugString(L"Create Space for depth map...\n");
+                        pHL2ResearchMode->m_RFCameraBuffer = new UINT8[outBufferCount];
+                    }
+                    memcpy(pHL2ResearchMode->m_RFCameraBuffer, pTexture.get(), outBufferCount * sizeof(UINT8));
+
+                    //// save pre-processed depth map texture (for visualization)
+                    //if (!pHL2ResearchMode->m_depthMapTexture)
+                    //{
+                    //    OutputDebugString(L"Create Space for depth map texture...\n");
+                    //    pHL2ResearchMode->m_depthMapTexture = new UINT8[outBufferCount];
+                    //}
+                    //memcpy(pHL2ResearchMode->m_depthMapTexture, pDepthTexture.get(), outBufferCount * sizeof(UINT8));
+                }
+
+                pHL2ResearchMode->m_RFCameraTextureUpdated = true;
+                //pHL2ResearchMode->m_pointCloudUpdated = true;
+
+                pTexture.reset();
+
+                // release space
+                if (pSensorFrame) {
+                    pSensorFrame->Release();
+                }
+                if (pVLCFrame)
+                {
+                    pVLCFrame->Release();
+                }
+
+            }
+        }
+        catch (...) {}
+        pHL2ResearchMode->m_pLFCameraSensor->CloseStream();
+        pHL2ResearchMode->m_pLFCameraSensor->Release();
+        pHL2ResearchMode->m_pLFCameraSensor = nullptr;
+        pHL2ResearchMode->m_pRFCameraSensor->CloseStream();
+        pHL2ResearchMode->m_pRFCameraSensor->Release();
+        pHL2ResearchMode->m_pRFCameraSensor = nullptr;
+        pHL2ResearchMode->m_pSensorDevice->Release();
+        pHL2ResearchMode->m_pSensorDevice = nullptr;
+        pHL2ResearchMode->m_pSensorDeviceConsent->Release();
+        pHL2ResearchMode->m_pSensorDeviceConsent = nullptr;
+    }
     void HL2ResearchMode::DepthSensorLoop(HL2ResearchMode* pHL2ResearchMode)
     {
         // prevent starting loop for multiple times
@@ -106,7 +366,7 @@ namespace winrt::HL2UnityPlugin::implementation
 
                 // process sensor frame
                 pDepthSensorFrame->GetResolution(&resolution);
-                pHL2ResearchMode->m_resolution = resolution;
+                pHL2ResearchMode->m_depthresolution = resolution;
                 
                 IResearchModeSensorDepthFrame* pDepthFrame = nullptr;
                 winrt::check_hresult(pDepthSensorFrame->QueryInterface(IID_PPV_ARGS(&pDepthFrame)));
@@ -114,7 +374,7 @@ namespace winrt::HL2UnityPlugin::implementation
                 size_t outBufferCount = 0;
                 const UINT16* pDepth = nullptr;
                 pDepthFrame->GetBuffer(&pDepth, &outBufferCount);
-                pHL2ResearchMode->m_bufferSize = outBufferCount;
+                pHL2ResearchMode->m_depthbufferSize = outBufferCount;
 
                 auto pDepthTexture = std::make_unique<uint8_t[]>(outBufferCount);
                 std::vector<float> pointCloud;
@@ -143,21 +403,13 @@ namespace winrt::HL2UnityPlugin::implementation
                 auto posMat = XMMatrixTranslation(pos.x, pos.y, pos.z);
                 auto depthToWorld = pHL2ResearchMode->m_depthCameraPoseInvMatrix * rotMat * posMat;
 
-                pHL2ResearchMode->mu.lock();
-                auto roiCenterFloat = XMFLOAT3(pHL2ResearchMode->m_roiCenter[0], pHL2ResearchMode->m_roiCenter[1], pHL2ResearchMode->m_roiCenter[2]);
-                auto roiBoundFloat = XMFLOAT3(pHL2ResearchMode->m_roiBound[0], pHL2ResearchMode->m_roiBound[1], pHL2ResearchMode->m_roiBound[2]);
-                pHL2ResearchMode->mu.unlock();
-                XMVECTOR roiCenter = XMLoadFloat3(&roiCenterFloat);
-                XMVECTOR roiBound = XMLoadFloat3(&roiBoundFloat);
-                
-
                 for (UINT i = 0; i < resolution.Height; i++)
                 {
                     for (UINT j = 0; j < resolution.Width; j++)
                     {
                         auto idx = resolution.Width * i + j;
                         UINT16 depth = pDepth[idx];
-                        depth = (depth > 4090) ? 0 : depth - pHL2ResearchMode->m_depthOffset;
+                        depth = (depth > 4090) ? 0 : depth;
 
                         // back-project point cloud within Roi
                         if (i > pHL2ResearchMode->depthCamRoi.kRowLower*resolution.Height&& i < pHL2ResearchMode->depthCamRoi.kRowUpper * resolution.Height &&
@@ -172,14 +424,9 @@ namespace winrt::HL2UnityPlugin::implementation
                             // apply transformation
                             auto pointInWorld = XMVector3Transform(tempPoint, depthToWorld);
 
-                            // filter point cloud based on region of interest
-                            if (!pHL2ResearchMode->m_useRoiFilter ||
-                                (pHL2ResearchMode->m_useRoiFilter && XMVector3InBounds(pointInWorld - roiCenter, roiBound)))
-                            {
-                                pointCloud.push_back(XMVectorGetX(pointInWorld));
-                                pointCloud.push_back(XMVectorGetY(pointInWorld));
-                                pointCloud.push_back(-XMVectorGetZ(pointInWorld));
-                            }
+                            pointCloud.push_back(XMVectorGetX(pointInWorld));
+                            pointCloud.push_back(XMVectorGetY(pointInWorld));
+                            pointCloud.push_back(-XMVectorGetZ(pointInWorld));
                         }
 
                         // save as grayscale texture pixel into temp buffer
@@ -187,17 +434,17 @@ namespace winrt::HL2UnityPlugin::implementation
                         else { pDepthTexture.get()[idx] = (uint8_t)((float)depth / 1000 * 255); }
 
                         // save the depth of center pixel
-                        if (i == (UINT)(0.35 * resolution.Height) && j == (UINT)(0.5 * resolution.Width)
-                            && pointCloud.size()>=3)
+                        if (i == (UINT)(0.35 * resolution.Height) && j == (UINT)(0.5 * resolution.Width))
                         {
-                            pHL2ResearchMode->m_centerDepth = depth;
+                            pHL2ResearchMode->m_depthcenterDepth = depth;
                             if (depth > pHL2ResearchMode->depthCamRoi.depthNearClip && depth < pHL2ResearchMode->depthCamRoi.depthFarClip)
                             {
                                 std::lock_guard<std::mutex> l(pHL2ResearchMode->mu);
-                                pHL2ResearchMode->m_centerPoint[0] = *(pointCloud.end() - 3);
-                                pHL2ResearchMode->m_centerPoint[1] = *(pointCloud.end() - 2);
-                                pHL2ResearchMode->m_centerPoint[2] = *(pointCloud.end() - 1);
+                                pHL2ResearchMode->m_depthcenterPoint[0] = *(pointCloud.end() - 3);
+                                pHL2ResearchMode->m_depthcenterPoint[1] = *(pointCloud.end() - 2);
+                                pHL2ResearchMode->m_depthcenterPoint[2] = *(pointCloud.end() - 1);
                             }
+                            
                         }
                     }
                 }
@@ -258,25 +505,401 @@ namespace winrt::HL2UnityPlugin::implementation
         pHL2ResearchMode->m_pSensorDeviceConsent->Release();
         pHL2ResearchMode->m_pSensorDeviceConsent = nullptr;
     }
+    void HL2ResearchMode::DepthSensorDALoop(HL2ResearchMode* pHL2ResearchMode)
+    {
+        if (!pHL2ResearchMode->m_LTDepthLoopStarted)
+        {
+            pHL2ResearchMode->m_LTDepthLoopStarted = true;
+        }
+        else {
+            return;
+        }
+
+        pHL2ResearchMode->m_LTDepthSensor->OpenStream();
+        try
+        {
+            while (pHL2ResearchMode->m_LTDepthLoopStarted)
+            {
+                IResearchModeSensorFrame* pDepthSensorFrame = nullptr;
+                ResearchModeSensorResolution resolution;
+                pHL2ResearchMode->m_LTDepthSensor->GetNextBuffer(&pDepthSensorFrame);
+
+                
+
+                // process sensor frame
+                pDepthSensorFrame->GetResolution(&resolution);
+                pHL2ResearchMode->m_LTDepthResolution = resolution;
+                pHL2ResearchMode->tmp = (int)resolution.Height;
+
+                IResearchModeSensorDepthFrame* pDepthFrame = nullptr;
+                winrt::check_hresult(pDepthSensorFrame->QueryInterface(IID_PPV_ARGS(&pDepthFrame)));
+
+                size_t outBufferCount = 0;
+                const BYTE* pSigma = nullptr;
+                pDepthFrame->GetSigmaBuffer(&pSigma, &outBufferCount);
+                //pHL2ResearchMode->tmp = pSigma[0];
+
+                const UINT16* pDepth = nullptr;
+                pDepthFrame->GetBuffer(&pDepth, &outBufferCount);
+                pHL2ResearchMode->m_LTDepthBufferSize = outBufferCount;
+                //pHL2ResearchMode->tmp = pDepth[0];
+
+                const UINT16* pAbImage = nullptr;
+                pDepthFrame->GetAbDepthBuffer(&pAbImage, &outBufferCount);
+                //pHL2ResearchMode->m_LTDepthBufferSize = outBufferCount;
+
+                auto pDepthTexture = std::make_unique<uint8_t[]>(outBufferCount);
+                auto pAbTexture = std::make_unique<uint8_t[]>(outBufferCount);
+
+                USHORT mask = 0x80;
+                USHORT maxshort = 0;
+                int maxClampDepth = 4000;
+                for (UINT i = 0; i < resolution.Height; i++)
+                {
+                    for (UINT j = 0; j < resolution.Width; j++)
+                    {
+                        auto idx = resolution.Width * i + j;
+
+                       
+                        BYTE inputPixel = pHL2ResearchMode->ConvertDepthPixel(
+                            pDepth[resolution.Width * i + j],
+                            pSigma ? pSigma[resolution.Width * i + j] : 0,
+                            mask,
+                            maxshort,
+                            0,
+                            maxClampDepth);
+                        pDepthTexture.get()[idx] = inputPixel;
+
+                       
+                        inputPixel = pHL2ResearchMode->ConvertDepthPixel(
+                            pAbImage[resolution.Width * i + j],
+                            pSigma ? pSigma[resolution.Width * i + j] : 0,
+                            mask,
+                            maxshort,
+                            0,
+                            maxClampDepth);
+                        pAbTexture.get()[idx] = inputPixel;
+
+                        //UINT16 depth = pDepth[idx];
+                        //if (depth == 0) { pDepthTexture.get()[idx] = 0; }
+                        //else { pDepthTexture.get()[idx] = (uint8_t)((float)depth / 1000 * 255); }
+
+                        //UINT16 Ab = pAbImage[idx];
+                        //if (Ab == 0) { pAbTexture.get()[idx] = 0; }
+                        //else { pAbTexture.get()[idx] = (uint8_t)((float)Ab / 1000 * 255);}
+                    }
+                }
+                //pHL2ResearchMode->tmp = pDepthTexture.get()[0];
+                // save data
+                {
+                    
+                    std::lock_guard<std::mutex> l(pHL2ResearchMode->LT);
+
+                    if (!pHL2ResearchMode->m_LTDepthBuffer)
+                    {
+                        OutputDebugString(L"Create Space for depth map texture...\n");
+                        pHL2ResearchMode->m_LTDepthBuffer = new UINT8[outBufferCount];
+                    }
+                    memcpy(pHL2ResearchMode->m_LTDepthBuffer, pDepthTexture.get(), outBufferCount * sizeof(UINT8));
+
+                    if (!pHL2ResearchMode->m_LTDepthAbBuffer)
+                    {
+                        OutputDebugString(L"Create Space for Ab map texture...\n");
+                        pHL2ResearchMode->m_LTDepthAbBuffer = new UINT8[outBufferCount];
+                    }
+                    memcpy(pHL2ResearchMode->m_LTDepthAbBuffer, pAbTexture.get(), outBufferCount * sizeof(UINT8));
+
+
+                }
+
+                pHL2ResearchMode->m_LTDepthTextureUpdated = true;
+                //pHL2ResearchMode->m_AbMapTextureUpdated = true;
+                //pHL2ResearchMode->m_pointCloudUpdated = true;
+
+                pDepthTexture.reset();
+                pAbTexture.reset();
+
+                // release space
+                if (pDepthFrame) {
+                    pDepthFrame->Release();
+                }
+                if (pDepthSensorFrame)
+                {
+                    pDepthSensorFrame->Release();
+                }
+
+                         
+                //pHL2ResearchMode->m_LTDepthSensor->CloseStream();
+
+
+            }
+            
+        }
+        catch (...) {}
+        pHL2ResearchMode->m_LTDepthSensor->CloseStream();
+        pHL2ResearchMode->m_LTDepthSensor->Release();
+        pHL2ResearchMode->m_LTDepthSensor = nullptr;
+        pHL2ResearchMode->m_pSensorDevice->Release();
+        pHL2ResearchMode->m_pSensorDevice = nullptr;
+        pHL2ResearchMode->m_pSensorDeviceConsent->Release();
+        pHL2ResearchMode->m_pSensorDeviceConsent = nullptr;
+    }
+
+
+
+
+    void HL2ResearchMode::AccelSensorLoop(HL2ResearchMode* pHL2ResearchMode)
+    {
+        // prevent starting loop for multiple times
+        if (!pHL2ResearchMode->m_AccelLoopStarted)
+        {
+            pHL2ResearchMode->m_AccelLoopStarted = true;
+        }
+        else {
+            return;
+        }
+
+        pHL2ResearchMode->m_pAccelSensor->OpenStream();
+        try
+        {
+            while (pHL2ResearchMode->m_AccelLoopStarted)
+            {
+                DirectX::XMFLOAT3 AccelSample;
+
+
+                IResearchModeSensorFrame* pSensorFrame = nullptr;
+                IResearchModeAccelFrame* pSensorAccelFrame = nullptr;
+
+
+                ResearchModeSensorTimestamp timeStamp;
+                const AccelDataStruct* pAccelBuffer = nullptr;
+                size_t BufferOutLength;
+
+               
+                pHL2ResearchMode->m_pAccelSensor->GetNextBuffer(&pSensorFrame);
+                pSensorFrame->QueryInterface(IID_PPV_ARGS(&pSensorAccelFrame));
+
+                pSensorAccelFrame->GetCalibratedAccelaration(&AccelSample);
+
+                //winrt::check_hresult(pSensorAccelFrame->GetCalibratedAccelarationSamples(&pAccelBuffer,&BufferOutLength));
+
+                // save data
+                {
+                    std::lock_guard<std::mutex> l(pHL2ResearchMode->Accel);
+
+
+                    // save raw depth map
+                  
+
+                    pHL2ResearchMode->m_AccelBuffer[0] = (float)AccelSample.x;
+                    pHL2ResearchMode->m_AccelBuffer[1] = (float)AccelSample.y;
+                    pHL2ResearchMode->m_AccelBuffer[2] = (float)AccelSample.z;
+         /*           pHL2ResearchMode->m_AccelBuffer[0] = pAccelBuffer[0].AccelValues[0];
+
+                    pHL2ResearchMode->m_AccelBuffer[1] = pAccelBuffer[0].AccelValues[1];
+
+                    pHL2ResearchMode->m_AccelBuffer[2] = pAccelBuffer[0].AccelValues[2];*/
+
+
+
+                   // memcpy(pHL2ResearchMode->m_RFCameraBuffer, pTexture.get(), outBufferCount * sizeof(UINT8));
+
+                }
+
+                pHL2ResearchMode->m_AccelUpdated = true;
+
+
+                // release space
+                if (pSensorFrame) {
+                    pSensorFrame->Release();
+                }
+                if (pSensorAccelFrame)
+                {
+                    pSensorAccelFrame->Release();
+                }
+
+
+            }
+        }
+        catch (...) {}
+        pHL2ResearchMode->m_pAccelSensor->CloseStream();
+        pHL2ResearchMode->m_pAccelSensor->Release();
+        pHL2ResearchMode->m_pAccelSensor = nullptr;
+    }
+    void HL2ResearchMode::GyroSensorLoop(HL2ResearchMode* pHL2ResearchMode)
+    {
+        // prevent starting loop for multiple times
+        if (!pHL2ResearchMode->m_GyroLoopStarted)
+        {
+            pHL2ResearchMode->m_GyroLoopStarted = true;
+        }
+        else {
+            return;
+        }
+
+        try
+        {
+            while (pHL2ResearchMode->m_GyroLoopStarted)
+            {
+                
+                DirectX::XMFLOAT3 GyroSample;
+                
+
+                IResearchModeSensorFrame* pSensorFrame = nullptr;
+                
+                IResearchModeGyroFrame* pGyroFrame = nullptr;
+               
+
+                ResearchModeSensorTimestamp timeStamp;
+                const AccelDataStruct* pAccelBuffer = nullptr;
+                size_t BufferOutLength;
+
+     
+                pHL2ResearchMode->m_pGyroSensor->OpenStream();
+                pHL2ResearchMode->m_pGyroSensor->GetNextBuffer(&pSensorFrame);
+                pSensorFrame->QueryInterface(IID_PPV_ARGS(&pGyroFrame));
+                pGyroFrame->GetCalibratedGyro(&GyroSample);
+                
+
+  
+
+                // save data
+                {
+                    std::lock_guard<std::mutex> l(pHL2ResearchMode->Gyro);
+
+
+                    // save raw depth map
+  
+
+                    pHL2ResearchMode->m_GyroBuffer[0] = GyroSample.x;
+                    pHL2ResearchMode->m_GyroBuffer[1] = GyroSample.y;
+                    pHL2ResearchMode->m_GyroBuffer[2] = GyroSample.z;
+
+
+                    // memcpy(pHL2ResearchMode->m_RFCameraBuffer, pTexture.get(), outBufferCount * sizeof(UINT8));
+
+                }
+
+                pHL2ResearchMode->m_GyroUpdated = true;
+
+
+                // release space
+                if (pSensorFrame) {
+                    pSensorFrame->Release();
+                }
+
+                if (pGyroFrame)
+                {
+                    pGyroFrame->Release();
+                }
+
+
+            }
+        }
+        catch (...) {}
+
+        pHL2ResearchMode->m_pGyroSensor->CloseStream();
+        pHL2ResearchMode->m_pGyroSensor->Release();
+        pHL2ResearchMode->m_pGyroSensor = nullptr;
+
+    }
+    void HL2ResearchMode::MagSensorLoop(HL2ResearchMode* pHL2ResearchMode)
+    {
+        // prevent starting loop for multiple times
+        if (!pHL2ResearchMode->m_MagLoopStarted)
+        {
+            pHL2ResearchMode->m_MagLoopStarted = true;
+        }
+        else {
+            return;
+        }
+
+        try
+        {
+            while (pHL2ResearchMode->m_MagLoopStarted)
+            {
+
+                DirectX::XMFLOAT3 MagSample;
+
+                IResearchModeSensorFrame* pSensorFrame = nullptr;
+
+                IResearchModeMagFrame* pMagFrame = nullptr;
+
+                ResearchModeSensorTimestamp timeStamp;
+                const AccelDataStruct* pAccelBuffer = nullptr;
+                size_t BufferOutLength;
+
+
+                pHL2ResearchMode->m_pMagSensor->OpenStream();
+                pHL2ResearchMode->m_pMagSensor->GetNextBuffer(&pSensorFrame);
+                pSensorFrame->QueryInterface(IID_PPV_ARGS(&pMagFrame));
+                pMagFrame->GetMagnetometer(&MagSample);
+                
+
+                // save data
+                {
+                    std::lock_guard<std::mutex> l(pHL2ResearchMode->Mag);
+
+
+                    // save raw depth map
+           
+
+                    pHL2ResearchMode->m_MagBuffer[0] = MagSample.x;
+                    pHL2ResearchMode->m_MagBuffer[1] = MagSample.y;
+                    pHL2ResearchMode->m_MagBuffer[2] = MagSample.z;
+
+                    // memcpy(pHL2ResearchMode->m_RFCameraBuffer, pTexture.get(), outBufferCount * sizeof(UINT8));
+
+                }
+
+                pHL2ResearchMode->m_MagUpdated = true;
+
+
+                // release space
+                if (pSensorFrame) {
+                    pSensorFrame->Release();
+                }
+
+                if (pMagFrame)
+                {
+                    pMagFrame->Release();
+                }
+
+            }
+        }
+        catch (...) {}
+        pHL2ResearchMode->m_pMagSensor->CloseStream();
+        pHL2ResearchMode->m_pMagSensor->Release();
+        pHL2ResearchMode->m_pMagSensor = nullptr;
+    }
+
+
 
     void HL2ResearchMode::CamAccessOnComplete(ResearchModeSensorConsent consent)
     {
         camAccessCheck = consent;
         SetEvent(camConsentGiven);
     }
+    void HL2ResearchMode::ImuAccessOnComplete(ResearchModeSensorConsent consent)
+    {
+        imuAccessCheck = consent;
+        SetEvent(imuConsentGiven);
+    }
+    inline UINT16 HL2ResearchMode::GetCenterDepth() {return m_depthcenterDepth;}
 
-    inline UINT16 HL2ResearchMode::GetCenterDepth() {return m_centerDepth;}
-
-    inline int HL2ResearchMode::GetBufferSize() { return m_bufferSize; }
+    inline int HL2ResearchMode::GetBufferSize() { return m_LTDepthBufferSize; }
+    inline UINT16 HL2ResearchMode::GetTemp() { return tmp; }
 
     inline bool HL2ResearchMode::DepthMapTextureUpdated() { return m_depthMapTextureUpdated; }
-
+    inline bool HL2ResearchMode::DepthLTMapTextureUpdated() { return m_LTDepthTextureUpdated; }
+    inline bool HL2ResearchMode::RFCameraTextureUpdated() { return m_RFCameraTextureUpdated; }
+    inline bool HL2ResearchMode::LFCameraTextureUpdated() { return m_LFCameraTextureUpdated; }
     inline bool HL2ResearchMode::PointCloudUpdated() { return m_pointCloudUpdated; }
 
     hstring HL2ResearchMode::PrintResolution()
     {
-        std::string res_c_ctr = std::to_string(m_resolution.Height) + "x" + std::to_string(m_resolution.Width) + "x" + std::to_string(m_resolution.BytesPerPixel);
-        return winrt::to_hstring(res_c_ctr);// m_resolution.Width
+        std::string res_c_ctr = std::to_string(m_depthresolution.Height) + "x" + std::to_string(m_depthresolution.Width) + "x" + std::to_string(m_depthresolution.BytesPerPixel);
+        return winrt::to_hstring(res_c_ctr);// m_depthresolution.Width
     }
 
     hstring HL2ResearchMode::PrintDepthExtrinsics()
@@ -319,6 +942,21 @@ namespace winrt::HL2UnityPlugin::implementation
             delete[] m_depthMapTexture;
             m_depthMapTexture = nullptr;
         }
+        if (m_AbMapTexture)
+        {
+            delete[] m_AbMapTexture;
+            m_AbMapTexture = nullptr;
+        }
+        if (m_LTDepthBuffer)
+        {
+            delete[] m_LTDepthBuffer;
+            m_LTDepthBuffer = nullptr;
+        }
+        if (m_LTDepthAbBuffer)
+        {
+            delete[] m_LTDepthAbBuffer;
+            m_LTDepthAbBuffer = nullptr;
+        }
         if (m_pointCloud) 
         {
             m_pointcloudLength = 0;
@@ -326,6 +964,7 @@ namespace winrt::HL2UnityPlugin::implementation
             m_pointCloud = nullptr;
             
         }
+      
     }
 
     com_array<uint16_t> HL2ResearchMode::GetDepthMapBuffer()
@@ -335,7 +974,7 @@ namespace winrt::HL2UnityPlugin::implementation
         {
             return com_array<uint16_t>();
         }
-        com_array<UINT16> tempBuffer = com_array<UINT16>(m_depthMap, m_depthMap + m_bufferSize);
+        com_array<UINT16> tempBuffer = com_array<UINT16>(m_depthMap, m_depthMap + m_depthbufferSize);
         
         return tempBuffer;
     }
@@ -348,11 +987,98 @@ namespace winrt::HL2UnityPlugin::implementation
         {
             return com_array<UINT8>();
         }
-        com_array<UINT8> tempBuffer = com_array<UINT8>(std::move_iterator(m_depthMapTexture), std::move_iterator(m_depthMapTexture + m_bufferSize));
+        com_array<UINT8> tempBuffer = com_array<UINT8>(std::move_iterator(m_depthMapTexture), std::move_iterator(m_depthMapTexture + m_depthbufferSize));
 
         m_depthMapTextureUpdated = false;
         return tempBuffer;
     }
+
+    com_array<uint8_t> HL2ResearchMode::GetLTMapTextureBuffer()
+    {
+        std::lock_guard<std::mutex> l(LT);
+        if (!m_LTDepthBuffer)
+        {
+            return com_array<UINT8>();
+        }
+        com_array<UINT8> tempBuffer = com_array<UINT8>(std::move_iterator(m_LTDepthBuffer), std::move_iterator(m_LTDepthBuffer + m_LTDepthBufferSize));
+
+        m_LTDepthTextureUpdated = false;
+        return tempBuffer;
+    }
+    com_array<uint8_t> HL2ResearchMode::GetAbMapTextureBuffer()
+    {
+        std::lock_guard<std::mutex> l(LT);
+        if (!m_LTDepthAbBuffer)
+        {
+            return com_array<UINT8>();
+        }
+        com_array<UINT8> tempBuffer = com_array<UINT8>(std::move_iterator(m_LTDepthAbBuffer), std::move_iterator(m_LTDepthAbBuffer + m_LTDepthBufferSize));
+
+        m_LTDepthTextureUpdated = false;
+        return tempBuffer;
+    }
+
+
+    com_array<uint8_t> HL2ResearchMode::GetCameraTextureBuffer(int a)
+    {
+        if(a==0)
+        {
+            std::lock_guard<std::mutex> l(LFC);
+            if (!m_LFCameraBuffer)
+            {
+                return com_array<UINT8>();
+            }
+            com_array<UINT8> tempBuffer = com_array<UINT8>(std::move_iterator(m_LFCameraBuffer), std::move_iterator(m_LFCameraBuffer + m_LFCameraBufferSize));
+
+            m_LFCameraTextureUpdated = false;
+            return tempBuffer;
+        }
+        else if (a == 1)
+        {
+            std::lock_guard<std::mutex> l(RFC);
+            if (!m_RFCameraBuffer)
+            {
+                return com_array<UINT8>();
+            }
+            com_array<UINT8> tempBuffer = com_array<UINT8>(std::move_iterator(m_RFCameraBuffer), std::move_iterator(m_RFCameraBuffer + m_RFCameraBufferSize));
+
+            m_RFCameraTextureUpdated = false;
+            return tempBuffer;
+        }
+        
+    }
+
+    com_array<float> HL2ResearchMode::GetAccelBuffer()
+    {
+        std::lock_guard<std::mutex> l(Accel);
+
+        com_array<float> tempBuffer = com_array<float>(std::move_iterator(m_AccelBuffer), std::move_iterator(m_AccelBuffer + 3));
+
+        m_AccelUpdated = false;
+        return tempBuffer;
+    }
+
+    com_array<float> HL2ResearchMode::GetGyroBuffer()
+    {
+        std::lock_guard<std::mutex> l(Gyro);
+
+        com_array<float> tempBuffer = com_array<float>(std::move_iterator(m_GyroBuffer), std::move_iterator(m_GyroBuffer + 3));
+
+        m_GyroUpdated = false;
+        return tempBuffer;
+    }
+
+    com_array<float> HL2ResearchMode::GetMagBuffer()
+    {
+        std::lock_guard<std::mutex> l(Mag);
+
+        com_array<float> tempBuffer = com_array<float>(std::move_iterator(m_MagBuffer), std::move_iterator(m_MagBuffer + 3));
+
+        m_MagUpdated = false;
+        return tempBuffer;
+    }
+
+
 
     // Get the buffer for point cloud in the form of float array.
     // There will be 3n elements in the array where the 3i, 3i+1, 3i+2 element correspond to x, y, z component of the i'th point. (i->[0,n-1])
@@ -372,17 +1098,9 @@ namespace winrt::HL2UnityPlugin::implementation
     com_array<float> HL2ResearchMode::GetCenterPoint()
     {
         std::lock_guard<std::mutex> l(mu);
-        com_array<float> centerPoint = com_array<float>(std::move_iterator(m_centerPoint), std::move_iterator(m_centerPoint + 3));
+        com_array<float> centerPoint = com_array<float>(std::move_iterator(m_depthcenterPoint), std::move_iterator(m_depthcenterPoint + 3));
 
         return centerPoint;
-    }
-
-    com_array<float> HL2ResearchMode::GetDepthSendorPosition()
-    {
-        std::lock_guard<std::mutex> l(mu);
-        com_array<float> depthSensorPos = com_array<float>(std::move_iterator(m_depthSensorPosition), std::move_iterator(m_depthSensorPosition + 3));
-
-        return depthSensorPos;
     }
 
     // Set the reference coordinate system. Need to be set before the sensor loop starts; otherwise, default coordinate will be used.
@@ -391,29 +1109,43 @@ namespace winrt::HL2UnityPlugin::implementation
         m_refFrame = refCoord;
     }
 
-    void HL2ResearchMode::SetPointCloudRoiInSpace(float centerX, float centerY, float centerZ, float boundX, float boundY, float boundZ)
-    {
-        std::lock_guard<std::mutex> l(mu);
-
-        m_useRoiFilter = true;
-        m_roiCenter[0] = centerX;
-        m_roiCenter[1] = centerY;
-        m_roiCenter[2] = -centerZ;
-
-        m_roiBound[0] = boundX;
-        m_roiBound[1] = boundY;
-        m_roiBound[2] = boundZ;
-    }
-
-    void HL2ResearchMode::SetPointCloudDepthOffset(uint16_t offset)
-    {
-        m_depthOffset = offset;
-    }
-
     long long HL2ResearchMode::checkAndConvertUnsigned(UINT64 val)
     {
         assert(val <= kMaxLongLong);
         return static_cast<long long>(val);
     }
 
+
+    BYTE HL2ResearchMode::ConvertDepthPixel(USHORT v, BYTE bSigma, USHORT mask, USHORT maxshort, const int vmin, const int vmax)
+    {
+        if ((mask != 0) && (bSigma & mask) > 0)
+        {
+            v = 0;
+        }
+
+        if ((maxshort != 0) && (v > maxshort))
+        {
+            v = 0;
+        }
+
+        float colorValue = 0.0f;
+        if (v <= vmin)
+        {
+            colorValue = 0.0f;
+        }
+        else if (v >= vmax)
+        {
+            colorValue = 1.0f;
+        }
+        else
+        {
+            colorValue = (float)(v - vmin) / (float)(vmax - vmin);
+        }
+
+        return (BYTE)(colorValue * 255);
+    }
+
+
+
+    
 }
