@@ -4,7 +4,6 @@ namespace HL2UnityPlugin
     {
         HL2ResearchMode();
         UInt16 GetCenterDepth();
-        UInt16[] GetDepthMapBuffer();
         UInt8[] GetDepthMapTextureBuffer();
         UInt8[] GetAbMapTextureBuffer();
         UInt8[] GetLTMapTextureBuffer();

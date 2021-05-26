@@ -35,9 +35,10 @@ namespace winrt::HL2UnityPlugin::implementation
         bool PointCloudUpdated();
         void SetReferenceCoordinateSystem(Windows::Perception::Spatial::SpatialCoordinateSystem refCoord);
         BYTE ConvertDepthPixel(USHORT v, BYTE bSigma, USHORT mask, USHORT maxshort, const int vmin, const int vmax);
-        com_array<uint16_t> GetDepthMapBuffer();
+
         com_array<uint8_t> GetDepthMapTextureBuffer();
         com_array<uint8_t> GetAbMapTextureBuffer();
+
         com_array<uint8_t> GetLTMapTextureBuffer();
         com_array<uint8_t> GetCameraTextureBuffer(int a);
         com_array<float> GetAccelBuffer();
@@ -58,7 +59,6 @@ namespace winrt::HL2UnityPlugin::implementation
     private:
         float* m_pointCloud = nullptr;
         int m_pointcloudLength = 0;
-        UINT16* m_depthMap = nullptr;
         UINT8* m_depthMapTexture = nullptr;
         UINT8* m_AbMapTexture = nullptr;
         IResearchModeSensor* m_depthSensor = nullptr;
@@ -87,8 +87,6 @@ namespace winrt::HL2UnityPlugin::implementation
         static void AccelSensorLoop(HL2ResearchMode* pHL2ResearchMode);
         static void GyroSensorLoop(HL2ResearchMode* pHL2ResearchMode);
         static void MagSensorLoop(HL2ResearchMode* pHL2ResearchMode);
-
-    
 
         static void CamAccessOnComplete(ResearchModeSensorConsent consent);
         static void ImuAccessOnComplete(ResearchModeSensorConsent consent);
